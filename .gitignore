@@ -1,0 +1,14 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Packaging artifacts
+*.egg-info/
+dist/
+build/
+
+# Test cache
+.pytest_cache/
+
