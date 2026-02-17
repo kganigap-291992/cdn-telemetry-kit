@@ -1,6 +1,6 @@
 [project]
 name = "cdn-telemetry-kit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Single source of truth for CDN telemetry schema + synthetic generator"
 requires-python = ">=3.10"
 dependencies = [
