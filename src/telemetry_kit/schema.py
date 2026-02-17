@@ -45,6 +45,18 @@ RAW_MINUTE_COLUMNS = [
     "http_4xx_count",
     "http_5xx_count",
 
+    # Detailed 2xx
+    "status_200",
+    "status_206",
+
+    # Detailed 3xx
+    "status_304",
+
+    # Detailed 4xx
+    "status_403",
+    "status_404",
+    "status_429",
+
     # Detailed 5xx breakdown (subset of http_5xx_count)
     "status_500",
     "status_502",

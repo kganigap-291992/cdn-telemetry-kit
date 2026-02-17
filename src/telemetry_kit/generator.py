@@ -79,11 +79,12 @@ def generate_minute_logs(
     Each row = 1 minute × 1 slice.
     Returns a DataFrame (no file I/O here).
 
-    Notes:
-    - We explicitly model 5xx as in the original generator.
-    - We derive 4xx and 3xx from remaining traffic via small rates,
-      then assign the rest to 2xx.
-    - Guarantees: http_2xx + http_3xx + http_4xx + http_5xx == requests
+    Guarantees:
+    - http_2xx + http_3xx + http_4xx + http_5xx == requests
+    - status_200 + status_206 == http_2xx
+    - status_304 == http_3xx
+    - status_403 + status_404 + status_429 == http_4xx
+    - status_500 + status_502 + status_503 + status_504 == http_5xx
     """
     rng = np.random.default_rng(seed)
 
@@ -167,7 +168,7 @@ def generate_minute_logs(
             avg_bytes = {"manifest": 18_000, "segment": 900_000, "api": 45_000}.get(ctype, 120_000)
             bytes_sent = int(requests * max(2000.0, rng.normal(avg_bytes, avg_bytes * 0.15)))
 
-            # --- Explicit 5xx (kept from original generator) ---
+            # --- Explicit 5xx ---
             base_500, base_502, base_503, base_504 = 0.0004, 0.0003, 0.0002, 0.0002
             if service == "app_backend":
                 base_500 *= 2.0
@@ -218,7 +219,9 @@ def generate_minute_logs(
             p95 = max(p95, p50)
             p99 = max(p99, p95)
 
-            # --- Bucketed status counts ---
+            # -----------------------------
+            # Bucketed status counts
+            # -----------------------------
             http_5xx = status_500 + status_502 + status_503 + status_504
             remaining = max(0, requests - http_5xx)
 
@@ -242,12 +245,52 @@ def generate_minute_logs(
             http_3xx = int(rng.binomial(remaining, min(base_3xx, 0.40)))
             remaining -= http_3xx
 
-            # Everything else is 2xx
             http_2xx = max(0, remaining)
 
-            # Final guarantee (paranoia check)
+            # Final guarantee for bucket sum
             if (http_2xx + http_3xx + http_4xx + http_5xx) != requests:
                 http_2xx = max(0, requests - (http_3xx + http_4xx + http_5xx))
+
+            # -----------------------------
+            # Detailed status breakdown
+            # -----------------------------
+            # 2xx: split 200 vs 206 (segments => mostly 206)
+            if http_2xx > 0:
+                if ctype == "segment":
+                    status_206 = int(rng.binomial(http_2xx, 0.90))
+                    status_200 = http_2xx - status_206
+                else:
+                    status_200 = int(rng.binomial(http_2xx, 0.85))
+                    status_206 = http_2xx - status_200
+            else:
+                status_200 = 0
+                status_206 = 0
+
+            # 3xx: model all as 304 for now
+            status_304 = http_3xx
+
+            # 4xx: split 403/404/429
+            if http_4xx > 0:
+                status_404 = int(rng.binomial(http_4xx, 0.50))
+                rem4 = http_4xx - status_404
+
+                status_403 = int(rng.binomial(rem4, 0.30))
+                rem4 -= status_403
+
+                status_429 = rem4
+            else:
+                status_403 = 0
+                status_404 = 0
+                status_429 = 0
+
+            # (Optional paranoia checks in dev; keep cheap)
+            if (status_200 + status_206) != http_2xx:
+                status_200 = max(0, http_2xx - status_206)
+            if status_304 != http_3xx:
+                status_304 = http_3xx
+            if (status_403 + status_404 + status_429) != http_4xx:
+                # Adjust 429 to absorb drift
+                status_429 = max(0, http_4xx - (status_403 + status_404))
 
             rows.append(
                 {
@@ -266,14 +309,27 @@ def generate_minute_logs(
                     "p95_ms": float(p95),
                     "p99_ms": float(p99),
                     "cache_hit_rate": float(cache_hit),
+
+                    # Buckets
                     "http_2xx_count": int(http_2xx),
                     "http_3xx_count": int(http_3xx),
                     "http_4xx_count": int(http_4xx),
                     "http_5xx_count": int(http_5xx),
+
+                    # Detailed 2xx / 3xx / 4xx
+                    "status_200": int(status_200),
+                    "status_206": int(status_206),
+                    "status_304": int(status_304),
+                    "status_403": int(status_403),
+                    "status_404": int(status_404),
+                    "status_429": int(status_429),
+
+                    # Detailed 5xx
                     "status_500": status_500,
                     "status_502": status_502,
                     "status_503": status_503,
                     "status_504": status_504,
+
                     "crc_errors": crc_errors,
                 }
             )
