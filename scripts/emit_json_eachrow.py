@@ -4,13 +4,13 @@ from __future__ import annotations
 import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-
 import argparse
 import json
 from datetime import datetime, timezone
 
 from telemetry_kit.generator import generate_minute_logs
 from telemetry_kit.schema import RAW_MINUTE_COLUMNS
+
 
 def to_ch_utc_str(dt: datetime) -> str:
     """ClickHouse-friendly UTC: 'YYYY-MM-DD HH:MM:SS' (no tz suffix)."""
@@ -59,8 +59,12 @@ def main():
     df["ts"] = df["ts"].apply(to_ch_utc_str)
 
     # JSONEachRow: one JSON per line
-    for row in df.to_dict(orient="records"):
-        print(json.dumps(row, separators=(",", ":"), ensure_ascii=False))
+    try:
+        for row in df.to_dict(orient="records"):
+            print(json.dumps(row, separators=(",", ":"), ensure_ascii=False))
+    except BrokenPipeError:
+        # When piping to `head`, stdout closes early — exit quietly.
+        sys.exit(0)
 
 
 if __name__ == "__main__":

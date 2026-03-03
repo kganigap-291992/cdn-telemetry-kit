@@ -12,3 +12,9 @@ build/
 # Test cache
 .pytest_cache/
 
+*.egg-info/
+*.egg-info
+dist/
+build/
+__pycache__/
+.venv/

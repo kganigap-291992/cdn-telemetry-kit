@@ -14,7 +14,7 @@ DEFAULT_REGIONS = [
 DEFAULT_UA_FAMILIES = ["stb", "mobile", "web", "smart_tv", "console"]
 
 # ------------------------------------------------------------
-# Stable column order for raw_minute CSV output
+# Stable column order for raw_minute output
 # Rule: never rename; never reorder existing; only ADD new columns.
 # ------------------------------------------------------------
 RAW_MINUTE_COLUMNS = [
@@ -66,3 +66,11 @@ RAW_MINUTE_COLUMNS = [
     # Other signals
     "crc_errors",
 ]
+
+# ------------------------------------------------------------
+# 15m aggregated output schema
+# Keep identical field set + order as RAW_MINUTE_COLUMNS.
+# This guarantees UI/SQL/ML pipelines can reuse the same codepaths.
+# ------------------------------------------------------------
+AGG_15M_BUCKET_MINUTES = 15
+AGG_15M_COLUMNS = RAW_MINUTE_COLUMNS

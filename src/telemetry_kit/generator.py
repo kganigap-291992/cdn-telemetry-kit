@@ -49,12 +49,155 @@ def _utc_minute_floor(dt: datetime) -> datetime:
     return dt.replace(second=0, microsecond=0)
 
 
+def _utc_bucket_floor(dt: datetime, bucket_minutes: int) -> datetime:
+    """
+    Floor dt to the start of its UTC bucket.
+    Example: 12:07 with bucket=15 => 12:00, 12:29 => 12:15.
+    """
+    if bucket_minutes <= 0:
+        raise ValueError("bucket_minutes must be > 0")
+    dt = _ensure_utc(dt).replace(second=0, microsecond=0)
+    m = (dt.minute // bucket_minutes) * bucket_minutes
+    return dt.replace(minute=m)
+
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
 def _matches(val: str, expected: str | None) -> bool:
     return True if expected is None else (val == expected)
+
+
+# -----------------------------
+# Aggregation (minute -> N-minute)
+# -----------------------------
+def aggregate_logs(df: pd.DataFrame, bucket_minutes: int = 15) -> pd.DataFrame:
+    """
+    Roll up minute-level aggregated rows into bucket_minutes buckets.
+
+    Principles:
+    - Sum all count-like metrics exactly (requests, bytes, status buckets, crc_errors).
+    - Compute request-weighted averages for:
+        - cache_hit_rate
+        - p50_ms / p95_ms / p99_ms
+      (Deterministic + stable; good for demo and ML features later.)
+    - Preserve invariants:
+        - http_2xx+http_3xx+http_4xx+http_5xx == requests (fix drift into 2xx)
+        - p50 <= p95 <= p99 (force ordering)
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if bucket_minutes <= 0:
+        raise ValueError("bucket_minutes must be > 0")
+
+    d = df.copy()
+
+    # Ensure ts is UTC datetime and floored to bucket start
+    d["ts"] = pd.to_datetime(d["ts"], utc=True)
+    d["ts"] = d["ts"].apply(lambda x: _utc_bucket_floor(x.to_pydatetime(), bucket_minutes))
+
+    keys = [
+        "seed",
+        "ts",
+        "partner",
+        "service",
+        "region",
+        "pop",
+        "host",
+        "content_type",
+        "ua_family",
+    ]
+
+    # Sum-exact metrics
+    sum_cols = [
+        "requests",
+        "bytes_sent",
+        "http_2xx_count",
+        "http_3xx_count",
+        "http_4xx_count",
+        "http_5xx_count",
+        "status_200",
+        "status_206",
+        "status_304",
+        "status_403",
+        "status_404",
+        "status_429",
+        "status_500",
+        "status_502",
+        "status_503",
+        "status_504",
+        "crc_errors",
+    ]
+
+    # Weighted metrics (by requests)
+    def _wmean(g: pd.DataFrame, col: str) -> float:
+        w = g["requests"].to_numpy(dtype=float)
+        x = g[col].to_numpy(dtype=float)
+        sw = float(w.sum())
+        if sw <= 0.0:
+            return 0.0
+        return float((w * x).sum() / sw)
+
+    grouped = d.groupby(keys, as_index=False)
+
+    out_sum = grouped[sum_cols].sum()
+
+    # Compute weighted metrics per group
+    weighted_rows = []
+    for _, g in grouped:
+        weighted_rows.append(
+            {
+                "seed": int(g["seed"].iloc[0]),
+                "ts": g["ts"].iloc[0],
+                "partner": g["partner"].iloc[0],
+                "service": g["service"].iloc[0],
+                "region": g["region"].iloc[0],
+                "pop": g["pop"].iloc[0],
+                "host": g["host"].iloc[0],
+                "content_type": g["content_type"].iloc[0],
+                "ua_family": g["ua_family"].iloc[0],
+                "p50_ms": _wmean(g, "p50_ms"),
+                "p95_ms": _wmean(g, "p95_ms"),
+                "p99_ms": _wmean(g, "p99_ms"),
+                "cache_hit_rate": _wmean(g, "cache_hit_rate"),
+            }
+        )
+    out_w = pd.DataFrame(weighted_rows)
+
+    # Merge summed + weighted
+    out = out_sum.merge(out_w, on=keys, how="left")
+
+    if out.empty:
+        return out
+
+    # Re-assert bucket sum invariant (absorb drift into 2xx)
+    bucket_sum = (
+        out["http_2xx_count"]
+        + out["http_3xx_count"]
+        + out["http_4xx_count"]
+        + out["http_5xx_count"]
+    )
+    drift = (out["requests"] - bucket_sum).astype(int)
+    if (drift != 0).any():
+        out.loc[drift != 0, "http_2xx_count"] = (
+            out.loc[drift != 0, "http_2xx_count"] + drift[drift != 0]
+        ).clip(lower=0)
+
+        # keep 2xx detailed counts consistent with 2xx bucket if needed:
+        # status_200 + status_206 should match http_2xx_count.
+        two_xx_detail = out["status_200"] + out["status_206"]
+        drift2 = (out["http_2xx_count"] - two_xx_detail).astype(int)
+        if (drift2 != 0).any():
+            # absorb into status_200 (safe choice)
+            out.loc[drift2 != 0, "status_200"] = (out.loc[drift2 != 0, "status_200"] + drift2[drift2 != 0]).clip(lower=0)
+
+    # Enforce percentile ordering
+    out["p95_ms"] = out[["p95_ms", "p50_ms"]].max(axis=1)
+    out["p99_ms"] = out[["p99_ms", "p95_ms"]].max(axis=1)
+
+    return out
 
 
 # -----------------------------
