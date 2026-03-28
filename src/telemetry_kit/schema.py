@@ -65,6 +65,26 @@ RAW_MINUTE_COLUMNS = [
 
     # Other signals
     "crc_errors",
+
+    # ATS result-code counts (additive only; do not rename)
+    "ats_tcp_hit_count",
+    "ats_tcp_cf_hit_count",
+    "ats_tcp_miss_count",
+    "ats_tcp_refresh_hit_count",
+    "ats_tcp_ref_fail_hit_count",
+    "ats_tcp_refresh_miss_count",
+    "ats_tcp_client_refresh_count",
+    "ats_tcp_ims_hit_count",
+    "ats_tcp_ims_miss_count",
+    "ats_tcp_swapfail_count",
+    "ats_err_client_abort_count",
+    "ats_err_client_read_error_count",
+    "ats_err_connect_fail_count",
+    "ats_err_dns_fail_count",
+    "ats_err_invalid_req_count",
+    "ats_err_read_timeout_count",
+    "ats_err_proxy_denied_count",
+    "ats_err_unknown_count",
 ]
 
 # ------------------------------------------------------------

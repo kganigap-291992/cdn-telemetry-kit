@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,28 @@ from .schema import (
     DEFAULT_CONTENT_TYPES,
     DEFAULT_UA_FAMILIES,
 )
+
+
+ATS_COLUMNS = [
+    "ats_tcp_hit_count",
+    "ats_tcp_cf_hit_count",
+    "ats_tcp_miss_count",
+    "ats_tcp_refresh_hit_count",
+    "ats_tcp_ref_fail_hit_count",
+    "ats_tcp_refresh_miss_count",
+    "ats_tcp_client_refresh_count",
+    "ats_tcp_ims_hit_count",
+    "ats_tcp_ims_miss_count",
+    "ats_tcp_swapfail_count",
+    "ats_err_client_abort_count",
+    "ats_err_client_read_error_count",
+    "ats_err_connect_fail_count",
+    "ats_err_dns_fail_count",
+    "ats_err_invalid_req_count",
+    "ats_err_read_timeout_count",
+    "ats_err_proxy_denied_count",
+    "ats_err_unknown_count",
+]
 
 
 # -----------------------------
@@ -77,14 +99,14 @@ def aggregate_logs(df: pd.DataFrame, bucket_minutes: int = 15) -> pd.DataFrame:
     Roll up minute-level aggregated rows into bucket_minutes buckets.
 
     Principles:
-    - Sum all count-like metrics exactly (requests, bytes, status buckets, crc_errors).
+    - Sum all count-like metrics exactly:
+      requests, bytes, status buckets, crc_errors, ATS counts.
     - Compute request-weighted averages for:
         - cache_hit_rate
         - p50_ms / p95_ms / p99_ms
-      (Deterministic + stable; good for demo and ML features later.)
     - Preserve invariants:
-        - http_2xx+http_3xx+http_4xx+http_5xx == requests (fix drift into 2xx)
-        - p50 <= p95 <= p99 (force ordering)
+        - http_2xx+http_3xx+http_4xx+http_5xx == requests
+        - p50 <= p95 <= p99
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -94,7 +116,6 @@ def aggregate_logs(df: pd.DataFrame, bucket_minutes: int = 15) -> pd.DataFrame:
 
     d = df.copy()
 
-    # Ensure ts is UTC datetime and floored to bucket start
     d["ts"] = pd.to_datetime(d["ts"], utc=True)
     d["ts"] = d["ts"].apply(lambda x: _utc_bucket_floor(x.to_pydatetime(), bucket_minutes))
 
@@ -110,7 +131,6 @@ def aggregate_logs(df: pd.DataFrame, bucket_minutes: int = 15) -> pd.DataFrame:
         "ua_family",
     ]
 
-    # Sum-exact metrics
     sum_cols = [
         "requests",
         "bytes_sent",
@@ -129,9 +149,9 @@ def aggregate_logs(df: pd.DataFrame, bucket_minutes: int = 15) -> pd.DataFrame:
         "status_503",
         "status_504",
         "crc_errors",
+        *ATS_COLUMNS,
     ]
 
-    # Weighted metrics (by requests)
     def _wmean(g: pd.DataFrame, col: str) -> float:
         w = g["requests"].to_numpy(dtype=float)
         x = g[col].to_numpy(dtype=float)
@@ -141,10 +161,8 @@ def aggregate_logs(df: pd.DataFrame, bucket_minutes: int = 15) -> pd.DataFrame:
         return float((w * x).sum() / sw)
 
     grouped = d.groupby(keys, as_index=False)
-
     out_sum = grouped[sum_cols].sum()
 
-    # Compute weighted metrics per group
     weighted_rows = []
     for _, g in grouped:
         weighted_rows.append(
@@ -166,13 +184,11 @@ def aggregate_logs(df: pd.DataFrame, bucket_minutes: int = 15) -> pd.DataFrame:
         )
     out_w = pd.DataFrame(weighted_rows)
 
-    # Merge summed + weighted
     out = out_sum.merge(out_w, on=keys, how="left")
 
     if out.empty:
         return out
 
-    # Re-assert bucket sum invariant (absorb drift into 2xx)
     bucket_sum = (
         out["http_2xx_count"]
         + out["http_3xx_count"]
@@ -185,15 +201,13 @@ def aggregate_logs(df: pd.DataFrame, bucket_minutes: int = 15) -> pd.DataFrame:
             out.loc[drift != 0, "http_2xx_count"] + drift[drift != 0]
         ).clip(lower=0)
 
-        # keep 2xx detailed counts consistent with 2xx bucket if needed:
-        # status_200 + status_206 should match http_2xx_count.
         two_xx_detail = out["status_200"] + out["status_206"]
         drift2 = (out["http_2xx_count"] - two_xx_detail).astype(int)
         if (drift2 != 0).any():
-            # absorb into status_200 (safe choice)
-            out.loc[drift2 != 0, "status_200"] = (out.loc[drift2 != 0, "status_200"] + drift2[drift2 != 0]).clip(lower=0)
+            out.loc[drift2 != 0, "status_200"] = (
+                out.loc[drift2 != 0, "status_200"] + drift2[drift2 != 0]
+            ).clip(lower=0)
 
-    # Enforce percentile ordering
     out["p95_ms"] = out[["p95_ms", "p50_ms"]].max(axis=1)
     out["p99_ms"] = out[["p99_ms", "p95_ms"]].max(axis=1)
 
@@ -228,6 +242,10 @@ def generate_minute_logs(
     - status_304 == http_3xx
     - status_403 + status_404 + status_429 == http_4xx
     - status_500 + status_502 + status_503 + status_504 == http_5xx
+
+    Phase 7 scope:
+    - keep realistic traffic/state/ATS/latency/correlation logic
+    - update aggregation support for ATS columns
     """
     rng = np.random.default_rng(seed)
 
@@ -243,7 +261,6 @@ def generate_minute_logs(
     pops = [f"pop_{i:03d}" for i in range(1, n_pops + 1)]
     hosts = [f"host_{i:04d}" for i in range(1, n_hosts + 1)]
 
-    # Build a pool of plausible slices
     slice_pool: List[Tuple[str, str, str, str, str, str, str]] = []
     for _ in range(5000):
         slice_pool.append(
@@ -258,21 +275,681 @@ def generate_minute_logs(
             )
         )
 
-    def traffic_multiplier(ts: datetime) -> float:
+    # -----------------------------
+    # Phase 2 traffic shaping helpers
+    # -----------------------------
+    def _hourly_base_multiplier(hour: int) -> float:
+        if 0 <= hour < 6:
+            return 0.42
+        if 6 <= hour < 9:
+            return 0.55 + (hour - 6) * 0.12
+        if 9 <= hour < 16:
+            return 0.95
+        if 16 <= hour < 19:
+            return 1.10 + (hour - 16) * 0.12
+        if 19 <= hour < 22:
+            return 1.45
+        return 0.92
+
+    def _weekend_modifier(ts: datetime) -> float:
+        return 1.12 if ts.weekday() >= 5 else 1.00
+
+    def _commute_modifier(ts: datetime, service: str, ctype: str) -> float:
+        if 7 <= ts.hour < 9:
+            if service in {"live", "live_ott", "vod"} and ctype == "manifest":
+                return 1.08
+        return 1.00
+
+    def _event_overlay(ts: datetime, service: str, ctype: str) -> float:
+        dow = ts.weekday()
         hour = ts.hour
-        return 0.85 + 0.35 * math.sin((hour - 14) * (2 * math.pi / 24))
+
+        event_strength = 0.0
+
+        if dow in {2, 4} and 19 <= hour < 22:
+            event_strength = 0.20
+
+        if dow in {5, 6} and 18 <= hour < 22:
+            event_strength = max(event_strength, 0.35)
+
+        if dow == 6 and 13 <= hour < 17:
+            event_strength = max(event_strength, 0.18)
+
+        if event_strength <= 0.0:
+            return 1.0
+
+        service_sensitivity = {
+            "live": 1.35,
+            "live_ott": 1.28,
+            "vod": 1.05,
+            "dvr": 1.00,
+            "eas": 0.95,
+            "app_backend": 0.88,
+        }.get(service, 1.0)
+
+        content_sensitivity = {
+            "segment": 1.25,
+            "manifest": 1.08,
+            "api": 0.82,
+        }.get(ctype, 1.0)
+
+        return 1.0 + (event_strength * service_sensitivity * content_sensitivity)
+
+    def traffic_multiplier(ts: datetime, service: str, ctype: str) -> float:
+        base = _hourly_base_multiplier(ts.hour)
+        weekend = _weekend_modifier(ts)
+        commute = _commute_modifier(ts, service, ctype)
+        event = _event_overlay(ts, service, ctype)
+        return base * weekend * commute * event
+
+    # -----------------------------
+    # Phase 3 sticky minute-state engine
+    # -----------------------------
+    STATES = [
+        "healthy",
+        "cache_pressure",
+        "origin_slow",
+        "network_issue",
+        "bad_incident",
+    ]
+
+    def _state_transition_probs(current_state: str, ts: datetime, service: str) -> list[float]:
+        hour = ts.hour
+        dow = ts.weekday()
+
+        prime_risk = 0.0
+        if 18 <= hour < 22:
+            prime_risk += 0.015
+        if dow in {5, 6} and 18 <= hour < 22:
+            prime_risk += 0.015
+        if dow == 6 and 13 <= hour < 17:
+            prime_risk += 0.010
+
+        service_risk = {
+            "live": 1.25,
+            "live_ott": 1.18,
+            "vod": 1.00,
+            "dvr": 0.95,
+            "eas": 0.90,
+            "app_backend": 1.05,
+        }.get(service, 1.0)
+
+        risk = prime_risk * service_risk
+
+        if current_state == "healthy":
+            p_healthy = max(0.88, 0.965 - risk)
+            p_cache = 0.012 + (risk * 0.50)
+            p_origin = 0.009 + (risk * 0.35)
+            p_network = 0.008 + (risk * 0.25)
+            p_bad = 0.006 + (risk * 0.10)
+            probs = [p_healthy, p_cache, p_origin, p_network, p_bad]
+        elif current_state == "cache_pressure":
+            probs = [0.14, 0.76, 0.05, 0.03, 0.02]
+        elif current_state == "origin_slow":
+            probs = [0.12, 0.05, 0.74, 0.03, 0.06]
+        elif current_state == "network_issue":
+            probs = [0.13, 0.03, 0.03, 0.72, 0.09]
+        else:
+            probs = [0.10, 0.05, 0.08, 0.07, 0.70]
+
+        total = sum(probs)
+        return [p / total for p in probs]
+
+    def _build_service_state_timelines() -> dict[str, list[str]]:
+        timelines: dict[str, list[str]] = {}
+        for service in services:
+            current_state = "healthy"
+            service_states: list[str] = []
+
+            for minute_idx in range(minutes):
+                ts = ts0 + timedelta(minutes=minute_idx)
+                probs = _state_transition_probs(current_state, ts, service)
+                current_state = str(rng.choice(STATES, p=probs))
+                service_states.append(current_state)
+
+            timelines[service] = service_states
+        return timelines
+
+    service_state_timelines = _build_service_state_timelines()
+
+    def _state_request_multiplier(state: str) -> float:
+        return {
+            "healthy": 1.00,
+            "cache_pressure": 0.98,
+            "origin_slow": 0.99,
+            "network_issue": 0.96,
+            "bad_incident": 0.93,
+        }[state]
+
+    def _state_cache_delta(state: str) -> float:
+        return {
+            "healthy": 0.00,
+            "cache_pressure": -0.08,
+            "origin_slow": -0.03,
+            "network_issue": -0.02,
+            "bad_incident": -0.15,
+        }[state]
+
+    def _state_latency_multipliers(state: str) -> tuple[float, float, float]:
+        return {
+            "healthy": (1.00, 1.00, 1.00),
+            "cache_pressure": (1.05, 1.12, 1.20),
+            "origin_slow": (1.12, 1.30, 1.45),
+            "network_issue": (1.08, 1.24, 1.52),
+            "bad_incident": (1.28, 1.62, 2.00),
+        }[state]
+
+    # -----------------------------
+    # Phase 4 ATS distribution
+    # -----------------------------
+    def _ats_family_targets(
+        state: str,
+        ctype: str,
+        service: str,
+        cache_hit: float,
+    ) -> Dict[str, float]:
+        if ctype == "segment":
+            hit_family = _clamp(cache_hit, 0.74, 0.90)
+            miss_family = 0.11
+            refresh_ims_family = 0.035
+            client_issue_family = 0.020
+            infra_fail_family = 0.004
+            rare_family = 0.001
+        elif ctype == "manifest":
+            hit_family = _clamp(cache_hit, 0.70, 0.86)
+            miss_family = 0.09
+            refresh_ims_family = 0.080
+            client_issue_family = 0.020
+            infra_fail_family = 0.008
+            rare_family = 0.002
+        else:
+            hit_family = _clamp(cache_hit, 0.52, 0.70)
+            miss_family = 0.22
+            refresh_ims_family = 0.035
+            client_issue_family = 0.025
+            infra_fail_family = 0.015
+            rare_family = 0.005
+
+        base_non_hit = (
+            miss_family
+            + refresh_ims_family
+            + client_issue_family
+            + infra_fail_family
+            + rare_family
+        )
+        residual = max(0.0, 1.0 - hit_family)
+        scale = residual / base_non_hit if base_non_hit > 0 else 1.0
+
+        miss_family *= scale
+        refresh_ims_family *= scale
+        client_issue_family *= scale
+        infra_fail_family *= scale
+        rare_family *= scale
+
+        if state == "cache_pressure":
+            hit_family -= 0.10
+            miss_family += 0.07
+            refresh_ims_family += 0.02
+            client_issue_family += 0.005
+            infra_fail_family += 0.003
+            rare_family += 0.002
+        elif state == "origin_slow":
+            hit_family -= 0.06
+            miss_family += 0.05
+            refresh_ims_family += 0.01
+            client_issue_family += 0.004
+            infra_fail_family += 0.010
+            rare_family += 0.002
+        elif state == "network_issue":
+            hit_family -= 0.05
+            miss_family += 0.02
+            refresh_ims_family += 0.005
+            client_issue_family += 0.020
+            infra_fail_family += 0.018
+            rare_family += 0.002
+        elif state == "bad_incident":
+            hit_family -= 0.16
+            miss_family += 0.08
+            refresh_ims_family += 0.02
+            client_issue_family += 0.020
+            infra_fail_family += 0.030
+            rare_family += 0.010
+
+        if service in {"live", "live_ott"} and ctype == "segment":
+            hit_family = min(hit_family + 0.02, 0.92)
+            miss_family = max(miss_family - 0.01, 0.01)
+        if service == "app_backend" and ctype == "api":
+            infra_fail_family += 0.005
+            hit_family -= 0.005
+
+        families = {
+            "hit_family": max(0.0, hit_family),
+            "miss_family": max(0.0, miss_family),
+            "refresh_ims_family": max(0.0, refresh_ims_family),
+            "client_issue_family": max(0.0, client_issue_family),
+            "infra_fail_family": max(0.0, infra_fail_family),
+            "rare_family": max(0.0, rare_family),
+        }
+
+        total = sum(families.values())
+        return {k: v / total for k, v in families.items()}
+
+    def _ats_code_probs(
+        state: str,
+        ctype: str,
+        service: str,
+        cache_hit: float,
+    ) -> Dict[str, float]:
+        fam = _ats_family_targets(state, ctype, service, cache_hit)
+
+        if ctype == "segment":
+            hit_split = {
+                "ats_tcp_hit_count": 0.86,
+                "ats_tcp_cf_hit_count": 0.14,
+            }
+            miss_split = {
+                "ats_tcp_miss_count": 0.70,
+                "ats_tcp_refresh_miss_count": 0.22,
+                "ats_tcp_ref_fail_hit_count": 0.08,
+            }
+            refresh_split = {
+                "ats_tcp_refresh_hit_count": 0.36,
+                "ats_tcp_client_refresh_count": 0.14,
+                "ats_tcp_ims_hit_count": 0.26,
+                "ats_tcp_ims_miss_count": 0.24,
+            }
+        elif ctype == "manifest":
+            hit_split = {
+                "ats_tcp_hit_count": 0.80,
+                "ats_tcp_cf_hit_count": 0.20,
+            }
+            miss_split = {
+                "ats_tcp_miss_count": 0.52,
+                "ats_tcp_refresh_miss_count": 0.24,
+                "ats_tcp_ref_fail_hit_count": 0.24,
+            }
+            refresh_split = {
+                "ats_tcp_refresh_hit_count": 0.28,
+                "ats_tcp_client_refresh_count": 0.22,
+                "ats_tcp_ims_hit_count": 0.22,
+                "ats_tcp_ims_miss_count": 0.28,
+            }
+        else:
+            hit_split = {
+                "ats_tcp_hit_count": 0.72,
+                "ats_tcp_cf_hit_count": 0.28,
+            }
+            miss_split = {
+                "ats_tcp_miss_count": 0.76,
+                "ats_tcp_refresh_miss_count": 0.14,
+                "ats_tcp_ref_fail_hit_count": 0.10,
+            }
+            refresh_split = {
+                "ats_tcp_refresh_hit_count": 0.42,
+                "ats_tcp_client_refresh_count": 0.18,
+                "ats_tcp_ims_hit_count": 0.20,
+                "ats_tcp_ims_miss_count": 0.20,
+            }
+
+        if state == "network_issue":
+            client_split = {
+                "ats_err_client_abort_count": 0.42,
+                "ats_err_client_read_error_count": 0.58,
+            }
+            infra_split = {
+                "ats_err_connect_fail_count": 0.24,
+                "ats_err_dns_fail_count": 0.10,
+                "ats_err_read_timeout_count": 0.66,
+            }
+        elif state == "origin_slow":
+            client_split = {
+                "ats_err_client_abort_count": 0.60,
+                "ats_err_client_read_error_count": 0.40,
+            }
+            infra_split = {
+                "ats_err_connect_fail_count": 0.26,
+                "ats_err_dns_fail_count": 0.08,
+                "ats_err_read_timeout_count": 0.66,
+            }
+        elif state == "bad_incident":
+            client_split = {
+                "ats_err_client_abort_count": 0.55,
+                "ats_err_client_read_error_count": 0.45,
+            }
+            infra_split = {
+                "ats_err_connect_fail_count": 0.30,
+                "ats_err_dns_fail_count": 0.12,
+                "ats_err_read_timeout_count": 0.58,
+            }
+        else:
+            client_split = {
+                "ats_err_client_abort_count": 0.68,
+                "ats_err_client_read_error_count": 0.32,
+            }
+            infra_split = {
+                "ats_err_connect_fail_count": 0.34,
+                "ats_err_dns_fail_count": 0.10,
+                "ats_err_read_timeout_count": 0.56,
+            }
+
+        rare_split = {
+            "ats_tcp_swapfail_count": 0.20,
+            "ats_err_invalid_req_count": 0.28,
+            "ats_err_proxy_denied_count": 0.16,
+            "ats_err_unknown_count": 0.36,
+        }
+
+        probs = {col: 0.0 for col in ATS_COLUMNS}
+
+        for col, frac in hit_split.items():
+            probs[col] += fam["hit_family"] * frac
+        for col, frac in miss_split.items():
+            probs[col] += fam["miss_family"] * frac
+        for col, frac in refresh_split.items():
+            probs[col] += fam["refresh_ims_family"] * frac
+        for col, frac in client_split.items():
+            probs[col] += fam["client_issue_family"] * frac
+        for col, frac in infra_split.items():
+            probs[col] += fam["infra_fail_family"] * frac
+        for col, frac in rare_split.items():
+            probs[col] += fam["rare_family"] * frac
+
+        total = sum(probs.values())
+        return {k: v / total for k, v in probs.items()}
+
+    def _sample_ats_counts(
+        requests: int,
+        state: str,
+        ctype: str,
+        service: str,
+        cache_hit: float,
+    ) -> Dict[str, int]:
+        probs = _ats_code_probs(state, ctype, service, cache_hit)
+        sampled = rng.multinomial(requests, [probs[col] for col in ATS_COLUMNS])
+        return {col: int(sampled[i]) for i, col in enumerate(ATS_COLUMNS)}
+
+    def _ats_family_shares(ats_counts: Dict[str, int], requests: int) -> Dict[str, float]:
+        if requests <= 0:
+            return {
+                "hit_family": 0.0,
+                "miss_family": 0.0,
+                "refresh_ims": 0.0,
+                "client_issues": 0.0,
+                "infra": 0.0,
+                "rare": 0.0,
+            }
+
+        hit_family = (
+            ats_counts["ats_tcp_hit_count"]
+            + ats_counts["ats_tcp_cf_hit_count"]
+        ) / requests
+
+        miss_family = (
+            ats_counts["ats_tcp_miss_count"]
+            + ats_counts["ats_tcp_refresh_miss_count"]
+            + ats_counts["ats_tcp_ref_fail_hit_count"]
+        ) / requests
+
+        refresh_ims = (
+            ats_counts["ats_tcp_refresh_hit_count"]
+            + ats_counts["ats_tcp_client_refresh_count"]
+            + ats_counts["ats_tcp_ims_hit_count"]
+            + ats_counts["ats_tcp_ims_miss_count"]
+        ) / requests
+
+        client_issues = (
+            ats_counts["ats_err_client_abort_count"]
+            + ats_counts["ats_err_client_read_error_count"]
+        ) / requests
+
+        infra = (
+            ats_counts["ats_err_connect_fail_count"]
+            + ats_counts["ats_err_dns_fail_count"]
+            + ats_counts["ats_err_read_timeout_count"]
+        ) / requests
+
+        rare = (
+            ats_counts["ats_tcp_swapfail_count"]
+            + ats_counts["ats_err_invalid_req_count"]
+            + ats_counts["ats_err_proxy_denied_count"]
+            + ats_counts["ats_err_unknown_count"]
+        ) / requests
+
+        return {
+            "hit_family": float(hit_family),
+            "miss_family": float(miss_family),
+            "refresh_ims": float(refresh_ims),
+            "client_issues": float(client_issues),
+            "infra": float(infra),
+            "rare": float(rare),
+        }
+
+    # -----------------------------
+    # Phase 5 latency shaping
+    # -----------------------------
+    def _ats_latency_pressure(ats_counts: Dict[str, int], requests: int) -> Dict[str, float]:
+        fam = _ats_family_shares(ats_counts, requests)
+        return {
+            "miss_rate": fam["miss_family"],
+            "refresh_ims_rate": fam["refresh_ims"],
+            "client_issue_rate": fam["client_issues"],
+            "infra_rate": fam["infra"],
+            "rare_rate": fam["rare"],
+        }
+
+    def _content_latency_scalars(ctype: str) -> Dict[str, float]:
+        if ctype == "segment":
+            return {
+                "base_floor_mult": 1.38,
+                "miss_weight": 4.1,
+                "refresh_weight": 1.35,
+                "client_weight": 2.2,
+                "infra_weight": 5.1,
+                "rare_weight": 2.3,
+                "p50_gain": 0.72,
+                "p95_gain": 1.55,
+                "p99_gain": 2.30,
+            }
+        if ctype == "manifest":
+            return {
+                "base_floor_mult": 1.10,
+                "miss_weight": 2.5,
+                "refresh_weight": 1.95,
+                "client_weight": 1.7,
+                "infra_weight": 3.9,
+                "rare_weight": 1.8,
+                "p50_gain": 0.45,
+                "p95_gain": 1.08,
+                "p99_gain": 1.68,
+            }
+        return {
+            "base_floor_mult": 0.82,
+            "miss_weight": 0.95,
+            "refresh_weight": 0.65,
+            "client_weight": 0.85,
+            "infra_weight": 1.75,
+            "rare_weight": 0.95,
+            "p50_gain": 0.14,
+            "p95_gain": 0.42,
+            "p99_gain": 0.76,
+        }
+
+    def _apply_latency_pressure(
+        p50: float,
+        p95: float,
+        p99: float,
+        ctype: str,
+        ats_counts: Dict[str, int],
+        requests: int,
+        minute_state: str,
+    ) -> tuple[float, float, float]:
+        pressure = _ats_latency_pressure(ats_counts, requests)
+        weights = _content_latency_scalars(ctype)
+
+        severity = (
+            pressure["miss_rate"] * weights["miss_weight"]
+            + pressure["refresh_ims_rate"] * weights["refresh_weight"]
+            + pressure["client_issue_rate"] * weights["client_weight"]
+            + pressure["infra_rate"] * weights["infra_weight"]
+            + pressure["rare_rate"] * weights["rare_weight"]
+        )
+
+        state_boost = {
+            "healthy": 1.00,
+            "cache_pressure": 1.08,
+            "origin_slow": 1.14,
+            "network_issue": 1.18,
+            "bad_incident": 1.28,
+        }[minute_state]
+
+        severity *= state_boost
+
+        p50 *= weights["base_floor_mult"]
+        p95 *= weights["base_floor_mult"]
+        p99 *= weights["base_floor_mult"]
+
+        if ctype == "segment":
+            playback_pressure = pressure["miss_rate"] + pressure["infra_rate"] + (0.45 * pressure["client_issue_rate"])
+            p95 *= 1.0 + (playback_pressure * 1.15)
+            p99 *= 1.0 + (playback_pressure * 1.55)
+        elif ctype == "manifest":
+            manifest_pressure = pressure["refresh_ims_rate"] + (0.55 * pressure["miss_rate"]) + (0.35 * pressure["infra_rate"])
+            p95 *= 1.0 + (manifest_pressure * 0.42)
+            p99 *= 1.0 + (manifest_pressure * 0.58)
+        else:
+            api_damp = 1.0 - min(0.22, pressure["refresh_ims_rate"] * 0.45)
+            p50 *= api_damp
+            p95 *= api_damp
+            p99 *= api_damp
+
+        p50 *= 1.0 + (severity * weights["p50_gain"])
+        p95 *= 1.0 + (severity * weights["p95_gain"])
+        p99 *= 1.0 + (severity * weights["p99_gain"])
+
+        return p50, p95, p99
+
+    # -----------------------------
+    # Phase 6 correlation helpers
+    # -----------------------------
+    def _derive_cache_hit_rate(
+        base_cache_hit: float,
+        ats_counts: Dict[str, int],
+        requests: int,
+        minute_state: str,
+    ) -> float:
+        fam = _ats_family_shares(ats_counts, requests)
+
+        ats_cache_view = (
+            fam["hit_family"]
+            + 0.35 * fam["refresh_ims"]
+            - 0.55 * fam["miss_family"]
+            - 0.35 * fam["infra"]
+            - 0.15 * fam["client_issues"]
+        )
+
+        state_shift = {
+            "healthy": 0.00,
+            "cache_pressure": -0.04,
+            "origin_slow": -0.02,
+            "network_issue": -0.02,
+            "bad_incident": -0.06,
+        }[minute_state]
+
+        blended = (
+            0.40 * base_cache_hit
+            + 0.60 * _clamp(ats_cache_view, 0.02, 0.99)
+            + state_shift
+        )
+        return float(_clamp(blended, 0.02, 0.99))
+
+    def _derive_5xx_rates(
+        service: str,
+        minute_state: str,
+        ats_counts: Dict[str, int],
+        requests: int,
+    ) -> tuple[float, float, float, float]:
+        fam = _ats_family_shares(ats_counts, requests)
+
+        infra = fam["infra"]
+        miss = fam["miss_family"]
+        rare = fam["rare"]
+
+        rate_500 = 0.0002
+        rate_502 = 0.00025
+        rate_503 = 0.0002
+        rate_504 = 0.0002
+
+        if service == "app_backend":
+            rate_500 *= 1.7
+            rate_504 *= 1.4
+
+        rate_500 += 0.05 * infra + 0.01 * rare
+        rate_502 += 0.09 * infra + 0.012 * rare
+        rate_503 += 0.05 * miss + 0.10 * infra + 0.012 * rare
+        rate_504 += 0.14 * infra + 0.008 * rare
+
+        state_mult = {
+            "healthy": (1.0, 1.0, 1.0, 1.0),
+            "cache_pressure": (1.0, 1.1, 1.25, 1.1),
+            "origin_slow": (1.15, 1.2, 1.65, 1.35),
+            "network_issue": (1.0, 1.25, 1.25, 1.9),
+            "bad_incident": (1.6, 1.7, 2.2, 2.0),
+        }[minute_state]
+
+        rate_500 *= state_mult[0]
+        rate_502 *= state_mult[1]
+        rate_503 *= state_mult[2]
+        rate_504 *= state_mult[3]
+
+        return (
+            float(_clamp(rate_500, 0.0, 0.20)),
+            float(_clamp(rate_502, 0.0, 0.20)),
+            float(_clamp(rate_503, 0.0, 0.20)),
+            float(_clamp(rate_504, 0.0, 0.20)),
+        )
+
+    def _derive_crc_errors(
+        bytes_sent: int,
+        ats_counts: Dict[str, int],
+        requests: int,
+        minute_state: str,
+    ) -> int:
+        fam = _ats_family_shares(ats_counts, requests)
+        mb = bytes_sent / 1e6
+
+        state_factor = {
+            "healthy": 1.00,
+            "cache_pressure": 1.08,
+            "origin_slow": 1.16,
+            "network_issue": 1.55,
+            "bad_incident": 1.90,
+        }[minute_state]
+
+        lam = (
+            mb * 0.0013
+            * state_factor
+            * (
+                1.0
+                + 3.2 * fam["infra"]
+                + 1.6 * fam["client_issues"]
+                + 0.8 * fam["rare"]
+            )
+        )
+        return int(rng.poisson(lam=max(0.0, lam)))
 
     rows = []
 
     for m in range(minutes):
         ts = ts0 + timedelta(minutes=m)
-        mult = traffic_multiplier(ts)
 
         k = max(50, int(len(slice_pool) * density))
         idxs = rng.choice(len(slice_pool), size=k, replace=False)
 
         for idx in idxs:
             partner, service, region, pop, host, ctype, ua_family = slice_pool[idx]
+            minute_state = service_state_timelines[service][m]
+
+            mult = traffic_multiplier(ts, service, ctype) * _state_request_multiplier(minute_state)
 
             base_rps = {
                 "live": 90,
@@ -292,7 +969,9 @@ def generate_minute_logs(
                 continue
 
             base_cache = {"manifest": 0.82, "segment": 0.90, "api": 0.55}.get(ctype, 0.75)
-            cache_hit = float(_clamp(rng.normal(base_cache, 0.05), 0.05, 0.99))
+            pre_ats_cache_hit = float(
+                _clamp(rng.normal(base_cache, 0.05) + _state_cache_delta(minute_state), 0.05, 0.99)
+            )
 
             base_p50 = {"manifest": 120, "segment": 80, "api": 160}.get(ctype, 110)
             svc_add = {
@@ -308,24 +987,67 @@ def generate_minute_logs(
             p95 = p50 * float(rng.normal(2.2, 0.25))
             p99 = p50 * float(rng.normal(3.4, 0.35))
 
+            lp50, lp95, lp99 = _state_latency_multipliers(minute_state)
+            p50 *= lp50
+            p95 *= lp95
+            p99 *= lp99
+
             avg_bytes = {"manifest": 18_000, "segment": 900_000, "api": 45_000}.get(ctype, 120_000)
             bytes_sent = int(requests * max(2000.0, rng.normal(avg_bytes, avg_bytes * 0.15)))
 
-            # --- Explicit 5xx ---
-            base_500, base_502, base_503, base_504 = 0.0004, 0.0003, 0.0002, 0.0002
-            if service == "app_backend":
-                base_500 *= 2.0
-                base_504 *= 1.5
+            ats_counts = _sample_ats_counts(
+                requests=requests,
+                state=minute_state,
+                ctype=ctype,
+                service=service,
+                cache_hit=pre_ats_cache_hit,
+            )
 
-            status_500 = int(rng.binomial(requests, base_500))
-            status_502 = int(rng.binomial(requests, base_502))
-            status_503 = int(rng.binomial(requests, base_503))
-            status_504 = int(rng.binomial(requests, base_504))
+            cache_hit = _derive_cache_hit_rate(
+                base_cache_hit=pre_ats_cache_hit,
+                ats_counts=ats_counts,
+                requests=requests,
+                minute_state=minute_state,
+            )
 
-            mb = bytes_sent / 1e6
-            crc_errors = int(rng.poisson(lam=max(0.0, mb * 0.002)))
+            p50, p95, p99 = _apply_latency_pressure(
+                p50=p50,
+                p95=p95,
+                p99=p99,
+                ctype=ctype,
+                ats_counts=ats_counts,
+                requests=requests,
+                minute_state=minute_state,
+            )
 
-            # --- Incidents modify metrics ---
+            rate_500, rate_502, rate_503, rate_504 = _derive_5xx_rates(
+                service=service,
+                minute_state=minute_state,
+                ats_counts=ats_counts,
+                requests=requests,
+            )
+
+            status_500 = int(rng.binomial(requests, rate_500))
+            status_502 = int(rng.binomial(requests, rate_502))
+            status_503 = int(rng.binomial(requests, rate_503))
+            status_504 = int(rng.binomial(requests, rate_504))
+
+            http_5xx_tmp = status_500 + status_502 + status_503 + status_504
+            max_5xx_allowed = int(requests * 0.40)
+            if http_5xx_tmp > max_5xx_allowed and http_5xx_tmp > 0:
+                scale = max_5xx_allowed / http_5xx_tmp
+                status_500 = int(round(status_500 * scale))
+                status_502 = int(round(status_502 * scale))
+                status_503 = int(round(status_503 * scale))
+                status_504 = int(round(status_504 * scale))
+
+            crc_errors = _derive_crc_errors(
+                bytes_sent=bytes_sent,
+                ats_counts=ats_counts,
+                requests=requests,
+                minute_state=minute_state,
+            )
+
             for inc in incidents:
                 if not (inc.start_ts <= ts < inc.end_ts):
                     continue
@@ -356,29 +1078,28 @@ def generate_minute_logs(
                     status_504 += int(requests * _clamp(0.015 * inten, 0.0, 0.35))
                     p99 *= 2.4 * inten
                 elif inc.kind == "crc_spike":
-                    crc_errors += int(max(0.0, mb * (0.25 * inten)))
+                    crc_errors += int(max(0.0, (bytes_sent / 1e6) * (0.25 * inten)))
 
-            # Ensure ordering sanity
             p95 = max(p95, p50)
             p99 = max(p99, p95)
 
-            # -----------------------------
-            # Bucketed status counts
-            # -----------------------------
             http_5xx = status_500 + status_502 + status_503 + status_504
             remaining = max(0, requests - http_5xx)
 
-            # 4xx baseline: slightly higher for app_backend + api
             base_4xx = 0.004
             if service == "app_backend":
                 base_4xx *= 2.0
             if ctype == "api":
                 base_4xx *= 1.5
 
+            if minute_state == "network_issue":
+                base_4xx *= 1.20
+            elif minute_state == "bad_incident":
+                base_4xx *= 1.35
+
             http_4xx = int(rng.binomial(remaining, min(base_4xx, 0.25)))
             remaining -= http_4xx
 
-            # 3xx baseline: redirects more likely on manifests/api
             base_3xx = 0.02
             if ctype == "manifest":
                 base_3xx *= 1.3
@@ -390,14 +1111,9 @@ def generate_minute_logs(
 
             http_2xx = max(0, remaining)
 
-            # Final guarantee for bucket sum
             if (http_2xx + http_3xx + http_4xx + http_5xx) != requests:
                 http_2xx = max(0, requests - (http_3xx + http_4xx + http_5xx))
 
-            # -----------------------------
-            # Detailed status breakdown
-            # -----------------------------
-            # 2xx: split 200 vs 206 (segments => mostly 206)
             if http_2xx > 0:
                 if ctype == "segment":
                     status_206 = int(rng.binomial(http_2xx, 0.90))
@@ -409,30 +1125,24 @@ def generate_minute_logs(
                 status_200 = 0
                 status_206 = 0
 
-            # 3xx: model all as 304 for now
             status_304 = http_3xx
 
-            # 4xx: split 403/404/429
             if http_4xx > 0:
                 status_404 = int(rng.binomial(http_4xx, 0.50))
                 rem4 = http_4xx - status_404
-
                 status_403 = int(rng.binomial(rem4, 0.30))
                 rem4 -= status_403
-
                 status_429 = rem4
             else:
                 status_403 = 0
                 status_404 = 0
                 status_429 = 0
 
-            # (Optional paranoia checks in dev; keep cheap)
             if (status_200 + status_206) != http_2xx:
                 status_200 = max(0, http_2xx - status_206)
             if status_304 != http_3xx:
                 status_304 = http_3xx
             if (status_403 + status_404 + status_429) != http_4xx:
-                # Adjust 429 to absorb drift
                 status_429 = max(0, http_4xx - (status_403 + status_404))
 
             rows.append(
@@ -446,34 +1156,28 @@ def generate_minute_logs(
                     "host": host,
                     "content_type": ctype,
                     "ua_family": ua_family,
-                    "requests": requests,
-                    "bytes_sent": bytes_sent,
+                    "requests": int(requests),
+                    "bytes_sent": int(bytes_sent),
                     "p50_ms": float(p50),
                     "p95_ms": float(p95),
                     "p99_ms": float(p99),
                     "cache_hit_rate": float(cache_hit),
-
-                    # Buckets
                     "http_2xx_count": int(http_2xx),
                     "http_3xx_count": int(http_3xx),
                     "http_4xx_count": int(http_4xx),
                     "http_5xx_count": int(http_5xx),
-
-                    # Detailed 2xx / 3xx / 4xx
                     "status_200": int(status_200),
                     "status_206": int(status_206),
                     "status_304": int(status_304),
                     "status_403": int(status_403),
                     "status_404": int(status_404),
                     "status_429": int(status_429),
-
-                    # Detailed 5xx
-                    "status_500": status_500,
-                    "status_502": status_502,
-                    "status_503": status_503,
-                    "status_504": status_504,
-
-                    "crc_errors": crc_errors,
+                    "status_500": int(status_500),
+                    "status_502": int(status_502),
+                    "status_503": int(status_503),
+                    "status_504": int(status_504),
+                    "crc_errors": int(crc_errors),
+                    **ats_counts,
                 }
             )
 
